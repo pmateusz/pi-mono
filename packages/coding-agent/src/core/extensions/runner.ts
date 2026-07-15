@@ -53,6 +53,8 @@ import type {
 	ResourcesDiscoverResult,
 	SessionBeforeCompactResult,
 	SessionBeforeForkResult,
+	SessionBeforeRetryEvent,
+	SessionBeforeRetryResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionShutdownEvent,
@@ -133,6 +135,7 @@ type RunnerEmitEvent = Exclude<
 	| MessageEndEvent
 	| ResourcesDiscoverEvent
 	| InputEvent
+	| SessionBeforeRetryEvent
 >;
 
 type SessionBeforeEvent = Extract<
@@ -830,6 +833,51 @@ export class ExtensionRunner {
 		}
 
 		return modified ? currentMessage : undefined;
+	}
+
+	async emitSessionBeforeRetry(event: SessionBeforeRetryEvent): Promise<SessionBeforeRetryResult | undefined> {
+		const ctx = this.createContext();
+		let retry: boolean | undefined;
+		let delayMs: number | undefined;
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("session_before_retry");
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				try {
+					// Later handlers see earlier overrides; the last returned value per field wins.
+					const currentEvent: SessionBeforeRetryEvent = {
+						...event,
+						retryable: retry ?? event.retryable,
+						delayMs: delayMs ?? event.delayMs,
+					};
+					const handlerResult = (await handler(currentEvent, ctx)) as SessionBeforeRetryResult | undefined;
+					if (!handlerResult) continue;
+
+					if (handlerResult.retry !== undefined) {
+						retry = handlerResult.retry;
+					}
+					if (handlerResult.delayMs !== undefined) {
+						delayMs = handlerResult.delayMs;
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "session_before_retry",
+						error: message,
+						stack,
+					});
+				}
+			}
+		}
+
+		if (retry === undefined && delayMs === undefined) {
+			return undefined;
+		}
+		return { retry, delayMs };
 	}
 
 	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {

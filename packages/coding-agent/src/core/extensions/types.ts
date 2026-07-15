@@ -17,6 +17,7 @@ import type {
 } from "@earendil-works/pi-agent-core";
 import type {
 	Api,
+	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Context,
@@ -599,6 +600,21 @@ export interface SessionCompactEvent {
 	willRetry: boolean;
 }
 
+/** Fired before the auto-retry decision on an errored assistant message (verdict can be overridden) */
+export interface SessionBeforeRetryEvent {
+	type: "session_before_retry";
+	/** The errored assistant message */
+	message: AssistantMessage;
+	/** Built-in classifier verdict; false for context-overflow errors (handled by compaction) */
+	retryable: boolean;
+	/** Upcoming retry attempt, 1-based */
+	attempt: number;
+	/** Configured retry.maxRetries */
+	maxAttempts: number;
+	/** Backoff delay for this attempt in milliseconds */
+	delayMs: number;
+}
+
 /** Fired before an extension runtime is torn down due to quit, reload, or session replacement. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
@@ -645,6 +661,7 @@ export type SessionEvent =
 	| SessionBeforeForkEvent
 	| SessionBeforeCompactEvent
 	| SessionCompactEvent
+	| SessionBeforeRetryEvent
 	| SessionShutdownEvent
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent;
@@ -1098,6 +1115,13 @@ export interface SessionBeforeCompactResult {
 	compaction?: CompactionResult;
 }
 
+export interface SessionBeforeRetryResult {
+	/** Override the retry verdict. Retry settings (enabled, maxRetries) still apply. */
+	retry?: boolean;
+	/** Override the backoff delay in milliseconds */
+	delayMs?: number;
+}
+
 export interface SessionBeforeTreeResult {
 	cancel?: boolean;
 	summary?: {
@@ -1182,6 +1206,10 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>,
 	): void;
 	on(event: "session_compact", handler: ExtensionHandler<SessionCompactEvent>): void;
+	on(
+		event: "session_before_retry",
+		handler: ExtensionHandler<SessionBeforeRetryEvent, SessionBeforeRetryResult>,
+	): void;
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;

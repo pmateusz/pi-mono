@@ -76,6 +76,7 @@ import {
 	type MessageUpdateEvent,
 	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
+	type SessionBeforeRetryResult,
 	type SessionBeforeTreeResult,
 	type SessionStartEvent,
 	type ShutdownHandler,
@@ -644,6 +645,7 @@ export class AgentSession {
 		}
 	};
 
+	/** Predicts the agent_end willRetry flag from the built-in classifier; session_before_retry handlers can still override the actual decision. */
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
@@ -1067,8 +1069,12 @@ export class AgentSession {
 			return false;
 		}
 
-		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
-			return true;
+		if (msg.stopReason === "error") {
+			const override = await this._emitSessionBeforeRetry(msg);
+			const shouldRetry = override?.retry ?? this._isRetryableError(msg);
+			if (shouldRetry && (await this._prepareRetry(msg, override?.delayMs))) {
+				return true;
+			}
 		}
 
 		if (msg.stopReason === "error" && this._retryAttempt > 0) {
@@ -2613,11 +2619,28 @@ export class AgentSession {
 		return isRetryableAssistantError(message);
 	}
 
+	/** Let extensions override the retry verdict and backoff for an errored assistant message. */
+	private async _emitSessionBeforeRetry(message: AssistantMessage): Promise<SessionBeforeRetryResult | undefined> {
+		if (!this._extensionRunner.hasHandlers("session_before_retry")) {
+			return undefined;
+		}
+		const settings = this.settingsManager.getRetrySettings();
+		const attempt = this._retryAttempt + 1;
+		return this._extensionRunner.emitSessionBeforeRetry({
+			type: "session_before_retry",
+			message,
+			retryable: this._isRetryableError(message),
+			attempt,
+			maxAttempts: settings.maxRetries,
+			delayMs: settings.baseDelayMs * 2 ** (attempt - 1),
+		});
+	}
+
 	/**
 	 * Prepare a retryable error for continuation with exponential backoff.
 	 * @returns true if the caller should continue the agent, false otherwise
 	 */
-	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
+	private async _prepareRetry(message: AssistantMessage, delayOverrideMs?: number): Promise<boolean> {
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled) {
 			return false;
@@ -2631,7 +2654,7 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const delayMs = delayOverrideMs ?? settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
 
 		this._emit({
 			type: "auto_retry_start",

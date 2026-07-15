@@ -15,6 +15,7 @@ import type {
 	ExtensionContextActions,
 	ExtensionUIContext,
 	ProviderConfig,
+	SessionBeforeRetryEvent,
 } from "../src/core/extensions/types.ts";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
@@ -981,6 +982,107 @@ describe("ExtensionRunner", () => {
 			expect(errors).toHaveLength(1);
 			expect(errors[0].event).toBe("before_provider_headers");
 			expect(errors[0].error).toContain("header handler boom");
+		});
+	});
+
+	describe("session_before_retry", () => {
+		function retryEvent(): SessionBeforeRetryEvent {
+			return {
+				type: "session_before_retry",
+				message: {
+					role: "assistant",
+					content: [],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "mock",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "error",
+					errorMessage: "some provider error",
+					timestamp: Date.now(),
+				},
+				retryable: false,
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 2000,
+			};
+		}
+
+		it("chains overrides so later handlers see earlier ones and the last value per field wins", async () => {
+			const force = `
+				export default function(pi) {
+					pi.on("session_before_retry", () => ({ retry: true, delayMs: 5000 }));
+				}
+			`;
+			const adjust = `
+				export default function(pi) {
+					pi.on("session_before_retry", (event) => {
+						if (event.retryable) {
+							return { delayMs: event.delayMs + 1 };
+						}
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "a-force.ts"), force);
+			fs.writeFileSync(path.join(extensionsDir, "b-adjust.ts"), adjust);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			expect(runner.hasHandlers("session_before_retry")).toBe(true);
+
+			const override = await runner.emitSessionBeforeRetry(retryEvent());
+			expect(override).toEqual({ retry: true, delayMs: 5001 });
+		});
+
+		it("returns undefined when no handler overrides anything", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("session_before_retry", () => undefined);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "noop.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			const override = await runner.emitSessionBeforeRetry(retryEvent());
+			expect(override).toBeUndefined();
+		});
+
+		it("isolates a throwing handler and still applies the others", async () => {
+			const throwing = `
+				export default function(pi) {
+					pi.on("session_before_retry", () => {
+						throw new Error("retry handler boom");
+					});
+				}
+			`;
+			const good = `
+				export default function(pi) {
+					pi.on("session_before_retry", () => ({ retry: false }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "a-throwing.ts"), throwing);
+			fs.writeFileSync(path.join(extensionsDir, "b-good.ts"), good);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: Array<{ event: string; error: string }> = [];
+			runner.onError((err) => errors.push(err));
+
+			const override = await runner.emitSessionBeforeRetry(retryEvent());
+
+			expect(override).toEqual({ retry: false, delayMs: undefined });
+			expect(errors).toHaveLength(1);
+			expect(errors[0].event).toBe("session_before_retry");
+			expect(errors[0].error).toContain("retry handler boom");
 		});
 	});
 });

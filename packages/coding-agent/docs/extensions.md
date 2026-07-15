@@ -309,6 +309,7 @@ user sends prompt ────────────────────�
   │   └─► turn_end                                 │       │
   │                                                        │
   ├─► agent_end                                            │
+  ├─► session_before_retry (on errored response; can override retry verdict/backoff)
   └─► agent_settled (no retry/compaction/follow-up left)   │
                                                            │
 user sends another prompt ◄────────────────────────────────┘
@@ -477,6 +478,30 @@ pi.on("session_compact", async (event, ctx) => {
   // event.fromExtension - whether extension provided it
   // event.reason - "manual" (/compact), "threshold", or "overflow"
   // event.willRetry - whether the aborted turn is retried after compaction (overflow recovery)
+});
+```
+
+#### session_before_retry
+
+Fired for every errored assistant message before the auto-retry decision. `retry` overrides the built-in verdict in either direction; `retry.enabled` and `retry.maxRetries` still apply. Context-overflow errors report `retryable: false` (handled by compaction). Later handlers see earlier overrides in the event fields; the last returned value per field wins.
+
+```typescript
+pi.on("session_before_retry", (event, ctx) => {
+  // event.message - the errored assistant message
+  // event.retryable - built-in classifier verdict
+  // event.attempt - upcoming retry attempt, 1-based
+  // event.maxAttempts - configured retry.maxRetries
+  // event.delayMs - backoff delay for this attempt
+
+  // Retry an error the built-in classifier misses:
+  if (!event.retryable && /my gateway error/i.test(event.message.errorMessage ?? "")) {
+    return { retry: true };
+  }
+
+  // Stop retrying when a circuit breaker trips:
+  if (tooManyConsecutiveFailures()) {
+    return { retry: false };
+  }
 });
 ```
 

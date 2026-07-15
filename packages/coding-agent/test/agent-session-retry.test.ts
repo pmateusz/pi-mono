@@ -7,10 +7,11 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -72,10 +73,13 @@ describe("AgentSession retry", () => {
 		failCount?: number;
 		maxRetries?: number;
 		delayAssistantMessageEndMs?: number;
+		errorMessage?: string;
+		extensions?: ExtensionFactory[];
 	}) {
 		const failCount = options?.failCount ?? 1;
 		const maxRetries = options?.maxRetries ?? 3;
 		const delayAssistantMessageEndMs = options?.delayAssistantMessageEndMs ?? 0;
+		const errorMessage = options?.errorMessage ?? "overloaded_error";
 		let callCount = 0;
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -89,7 +93,7 @@ describe("AgentSession retry", () => {
 					if (callCount <= failCount) {
 						const msg = createAssistantMessage("", {
 							stopReason: "error",
-							errorMessage: "overloaded_error",
+							errorMessage,
 						});
 						stream.push({ type: "start", partial: msg });
 						stream.push({ type: "error", reason: "error", error: msg });
@@ -110,13 +114,17 @@ describe("AgentSession retry", () => {
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries, baseDelayMs: 1 } });
 
+		const extensionsResult = options?.extensions
+			? await createTestExtensionsResult(options.extensions, tempDir)
+			: undefined;
+
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settingsManager,
 			cwd: tempDir,
 			modelRuntime: getModelRuntime(modelRegistry),
-			resourceLoader: createTestResourceLoader(),
+			resourceLoader: createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined),
 		});
 
 		if (delayAssistantMessageEndMs > 0) {
@@ -163,6 +171,58 @@ describe("AgentSession retry", () => {
 		expect(events).toContain("start:2");
 		expect(events).toContain("end:success=false");
 		expect(created.session.isRetrying).toBe(false);
+	});
+
+	it("session_before_retry can veto a retryable error", async () => {
+		const created = await createSession({
+			failCount: 99,
+			maxRetries: 3,
+			extensions: [
+				(pi) => {
+					pi.on("session_before_retry", () => ({ retry: false }));
+				},
+			],
+		});
+		const events: string[] = [];
+		created.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+		});
+
+		await created.session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(1);
+		expect(events).toEqual([]);
+	});
+
+	it("session_before_retry can force retry of a non-retryable error and override the delay", async () => {
+		const created = await createSession({
+			failCount: 1,
+			errorMessage: "unclassified gateway verdict",
+			extensions: [
+				(pi) => {
+					pi.on("session_before_retry", (event) => {
+						if (!event.retryable) {
+							return { retry: true, delayMs: 7 };
+						}
+					});
+				},
+			],
+		});
+		const events: string[] = [];
+		const delays: number[] = [];
+		created.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") {
+				events.push(`start:${event.attempt}`);
+				delays.push(event.delayMs);
+			}
+			if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
+		});
+
+		await created.session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(2);
+		expect(events).toEqual(["start:1", "end:success=true"]);
+		expect(delays).toEqual([7]);
 	});
 
 	it("prompt waits for retry completion even when assistant message_end handling is delayed", async () => {

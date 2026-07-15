@@ -114,6 +114,7 @@ export type {
 	ResolvedCommand,
 	SessionBeforeCompactEvent,
 	SessionBeforeForkEvent,
+	SessionBeforeRetryEvent,
 	SessionBeforeSwitchEvent,
 	SessionBeforeTreeEvent,
 	SessionCompactEvent,
